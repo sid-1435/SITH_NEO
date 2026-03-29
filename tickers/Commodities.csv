@@ -1,0 +1,18 @@
+﻿Symbol,Name,Category
+GC=F,Gold,Precious Metals
+SI=F,Silver,Precious Metals
+PL=F,Platinum,Precious Metals
+PA=F,Palladium,Precious Metals
+HG=F,Copper,Industrial Metals
+CL=F,Crude Oil (WTI),Energy
+BZ=F,Brent Crude Oil,Energy
+NG=F,Natural Gas,Energy
+RB=F,RBOB Gasoline,Energy
+HO=F,Heating Oil,Energy
+ZC=F,Corn,Agriculture
+ZW=F,Wheat,Agriculture
+ZS=F,Soybeans,Agriculture
+KC=F,Coffee,Agriculture
+CT=F,Cotton,Agriculture
+SB=F,Sugar,Agriculture
+CC=F,Cocoa,Agriculture

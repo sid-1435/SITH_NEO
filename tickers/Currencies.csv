@@ -1,0 +1,14 @@
+﻿Symbol,Name,Category
+EURUSD=X,EUR/USD (Euro),Major
+JPYUSD=X,JPY/USD (Japanese Yen),Major
+GBPUSD=X,GBP/USD (British Pound),Major
+AUDUSD=X,AUD/USD (Australian Dollar),Major
+CADUSD=X,CAD/USD (Canadian Dollar),Major
+CHFUSD=X,CHF/USD (Swiss Franc),Major
+CNYUSD=X,CNY/USD (Chinese Yuan),Major
+INRUSD=X,INR/USD (Indian Rupee),Major
+HKDUSD=X,HKD/USD (Hong Kong Dollar),Major
+SGDUSD=X,SGD/USD (Singapore Dollar),Major
+EURGBP=X,EUR/GBP (Euro/Pound),Cross
+EURJPY=X,EUR/JPY (Euro/Yen),Cross
+GBPJPY=X,GBP/JPY (Pound/Yen),Cross
