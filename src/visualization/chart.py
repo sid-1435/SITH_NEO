@@ -357,22 +357,31 @@ class ChartRenderer:
         
         x_coords = []
         y_coords = []
-        
-        # Collect wave start points
-        for wave in waves:
-            if hasattr(wave, 'start_time') and hasattr(wave, 'start_price'):
-                if wave.start_time is not None and wave.start_price is not None:
-                    x_coords.append(ChartRenderer._format_x_value(wave.start_time, remove_gaps))
-                    y_coords.append(wave.start_price)
-        
-        # Add last wave's end point
-        if waves:
-            last_wave = waves[-1]
-            if hasattr(last_wave, 'end_time') and hasattr(last_wave, 'end_price'):
-                if last_wave.end_time is not None and last_wave.end_price is not None:
-                    x_coords.append(ChartRenderer._format_x_value(last_wave.end_time, remove_gaps))
-                    y_coords.append(last_wave.end_price)
-        
+
+        for i, wave in enumerate(waves):
+            if not (hasattr(wave, 'start_time') and hasattr(wave, 'start_price')):
+                continue
+            if wave.start_time is None or wave.start_price is None:
+                continue
+
+            # Insert None break between non-contiguous waves
+            if x_coords and i > 0:
+                prev_wave = waves[i - 1]
+                if hasattr(prev_wave, 'end_time') and prev_wave.end_time is not None:
+                    prev_end_x = ChartRenderer._format_x_value(prev_wave.end_time, remove_gaps)
+                    this_start_x = ChartRenderer._format_x_value(wave.start_time, remove_gaps)
+                    if prev_end_x != this_start_x:
+                        x_coords.append(None)
+                        y_coords.append(None)
+
+            x_coords.append(ChartRenderer._format_x_value(wave.start_time, remove_gaps))
+            y_coords.append(wave.start_price)
+
+            if hasattr(wave, 'end_time') and hasattr(wave, 'end_price'):
+                if wave.end_time is not None and wave.end_price is not None:
+                    x_coords.append(ChartRenderer._format_x_value(wave.end_time, remove_gaps))
+                    y_coords.append(wave.end_price)
+
         # Add trace if we have enough points
         if len(x_coords) >= 2 and len(y_coords) >= 2:
             fig.add_trace(go.Scatter(
@@ -382,7 +391,8 @@ class ChartRenderer:
                 name=name,
                 line=dict(color=color, width=width, dash=dash),
                 hovertemplate='$%{y:.2f}<extra></extra>',
-                showlegend=True
+                showlegend=True,
+                connectgaps=False
             ))
         
         return fig
@@ -815,27 +825,48 @@ class ChartRenderer:
                                       line_dash: str,
                                       name: str,
                                       remove_gaps: bool = True) -> go.Figure:
-        """Add wave lines for a specific degree level"""
+        """
+        Add wave lines for a specific degree level.
+
+        FIX: Previously all waves were joined into one continuous polyline,
+        which connected visually separate patterns with a spurious diagonal
+        line and made it look like patterns only appeared in one region.
+        Now we insert a None break whenever a wave's start does not match
+        the previous wave's end, so each pattern segment is drawn
+        independently within the same legend trace.
+        """
         if not waves:
             return fig
-        
+
         x_coords = []
         y_coords = []
-        
-        for wave in waves:
-            if hasattr(wave, 'start_time') and hasattr(wave, 'start_price'):
-                if wave.start_time is not None and wave.start_price is not None:
-                    x_coords.append(ChartRenderer._format_x_value(wave.start_time, remove_gaps))
-                    y_coords.append(wave.start_price)
-        
-        # Add last wave end point
-        if waves:
-            last = waves[-1]
-            if hasattr(last, 'end_time') and hasattr(last, 'end_price'):
-                if last.end_time is not None and last.end_price is not None:
-                    x_coords.append(ChartRenderer._format_x_value(last.end_time, remove_gaps))
-                    y_coords.append(last.end_price)
-        
+
+        for i, wave in enumerate(waves):
+            if not (hasattr(wave, 'start_time') and hasattr(wave, 'start_price')):
+                continue
+            if wave.start_time is None or wave.start_price is None:
+                continue
+
+            # Detect discontinuity: if this wave's start doesn't follow the
+            # previous wave's end, insert a None break to lift the pen.
+            if x_coords:
+                prev_wave = waves[i - 1] if i > 0 else None
+                if prev_wave and hasattr(prev_wave, 'end_time') and prev_wave.end_time is not None:
+                    prev_end_x = ChartRenderer._format_x_value(prev_wave.end_time, remove_gaps)
+                    this_start_x = ChartRenderer._format_x_value(wave.start_time, remove_gaps)
+                    if prev_end_x != this_start_x:
+                        x_coords.append(None)
+                        y_coords.append(None)
+
+            x_coords.append(ChartRenderer._format_x_value(wave.start_time, remove_gaps))
+            y_coords.append(wave.start_price)
+
+            # After the last point of each wave, add its end point
+            if hasattr(wave, 'end_time') and hasattr(wave, 'end_price'):
+                if wave.end_time is not None and wave.end_price is not None:
+                    x_coords.append(ChartRenderer._format_x_value(wave.end_time, remove_gaps))
+                    y_coords.append(wave.end_price)
+
         if len(x_coords) >= 2:
             fig.add_trace(go.Scatter(
                 x=x_coords,
@@ -848,9 +879,10 @@ class ChartRenderer:
                     dash=line_dash
                 ),
                 hovertemplate='$%{y:.2f}<extra></extra>',
-                showlegend=True
+                showlegend=True,
+                connectgaps=False  # Respect the None breaks
             ))
-        
+
         return fig
     
     @staticmethod
