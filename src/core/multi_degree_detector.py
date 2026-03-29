@@ -491,7 +491,7 @@ class HierarchicalWaveBuilder:
         return results
 
     # ------------------------------------------------------------------
-    # Wave construction
+    # Wave construction (FIXED)
     # ------------------------------------------------------------------
 
     def _build_waves_from_pivots(self,
@@ -506,8 +506,7 @@ class HierarchicalWaveBuilder:
         sorted_pivots = sorted(pivots, key=lambda p: p['time'])
         num_waves = len(sorted_pivots) - 1
 
-        # Check specific counts BEFORE generic >= 5 to avoid 7/9 being
-        # mislabelled with motive labels.
+        # FIX: Check exact counts first to avoid mislabeling
         if num_waves == 9:
             labels = (config.labels_corrective[:9]
                       if len(config.labels_corrective) >= 9
@@ -524,17 +523,21 @@ class HierarchicalWaveBuilder:
                 WaveType.MOTIVE if i % 2 == 0 else WaveType.CORRECTIVE
                 for i in range(7)
             ]
-        elif num_waves >= 5:
+        elif num_waves == 5:  # CHANGED: exact match, not >=
             labels = config.labels_motive[:5]
             wave_types = [
                 WaveType.MOTIVE, WaveType.CORRECTIVE, WaveType.MOTIVE,
                 WaveType.CORRECTIVE, WaveType.MOTIVE
             ]
-        elif num_waves >= 3:
+        elif num_waves == 3:  # CHANGED: exact match, not >=
             labels = config.labels_corrective[:3]
             wave_types = [WaveType.MOTIVE, WaveType.CORRECTIVE, WaveType.MOTIVE]
         else:
-            labels = config.labels_motive[:num_waves]
+            # Fallback for any other count (1, 2, 4, 6, 8, 10+)
+            # Use motive labels and alternate types
+            labels = (config.labels_motive[:num_waves] 
+                      if num_waves <= len(config.labels_motive)
+                      else [f"W{i+1}" for i in range(num_waves)])
             wave_types = [
                 WaveType.MOTIVE if i % 2 == 0 else WaveType.CORRECTIVE
                 for i in range(num_waves)
