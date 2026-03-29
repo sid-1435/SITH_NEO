@@ -1,6 +1,23 @@
 """
 Multi-Degree Pivot Detection and Hierarchical Wave Building
 With integrated pattern validation.
+
+ARCHITECTURE FIX:
+The previous version detected pivots at all three degrees independently on
+the full dataset, then tried to build patterns from ALL of them at once.
+This caused every monowave to be labelled at the same level (A-I repeatedly)
+because there was no true hierarchy — subwaves were never actually nested
+inside parent waves.
+
+Correct approach (top-down):
+  1. Detect PRIMARY pivots (coarsest, fewest points) on the full df.
+  2. Build Primary-level wave patterns from those pivots.
+  3. For EACH Primary wave, slice df to its time window, detect
+     INTERMEDIATE pivots inside that slice, build Intermediate sub-waves.
+  4. For EACH Intermediate wave, repeat for MINOR degree.
+
+This guarantees sub-waves are always contained within their parent wave,
+and labels reset correctly for each parent segment.
 """
 
 import pandas as pd
@@ -16,295 +33,212 @@ from .pivot_detector import AdaptivePivotDetector
 from .monowave import Monowave, MonowaveConstructor
 
 
+# ---------------------------------------------------------------------------
+# Pivot detection
+# ---------------------------------------------------------------------------
+
 class MultiDegreePivotDetector:
     """
-    Detects pivots at multiple degree levels simultaneously.
-    Each degree uses different sensitivity settings.
+    Detects pivots at multiple degree levels.
+    Primary uses the coarsest (largest lookback/min-move) settings.
+    Each successive degree is finer.
     """
-    
+
     def __init__(self, degrees: List[WaveDegree] = None):
         self.degrees = degrees or [
             WaveDegree.PRIMARY,
             WaveDegree.INTERMEDIATE,
             WaveDegree.MINOR
         ]
-    
+
     def detect_all(self, df: pd.DataFrame) -> Dict[WaveDegree, List[Dict]]:
-        """Detect pivots at all configured degree levels."""
+        """Detect pivots at all configured degree levels on the full dataset."""
         results = {}
-        
         for degree in self.degrees:
             config = DEGREE_CONFIGS.get(degree)
             if not config:
                 continue
-            
             detector = AdaptivePivotDetector(
                 lookback=config.lookback,
                 lookahead=config.lookahead,
                 min_price_move_pct=config.min_price_move_pct
             )
-            
             pivots = detector.detect(df)
-            
-            for pivot in pivots:
-                pivot['degree'] = degree
-            
+            for p in pivots:
+                p['degree'] = degree
             results[degree] = pivots
-        
         return results
 
+    def detect_for_degree(self, df: pd.DataFrame,
+                           degree: WaveDegree) -> List[Dict]:
+        """Detect pivots for a single degree on a (possibly sliced) DataFrame."""
+        config = DEGREE_CONFIGS.get(degree)
+        if not config:
+            return []
+        detector = AdaptivePivotDetector(
+            lookback=config.lookback,
+            lookahead=config.lookahead,
+            min_price_move_pct=config.min_price_move_pct
+        )
+        pivots = detector.detect(df)
+        for p in pivots:
+            p['degree'] = degree
+        return pivots
+
+
+# ---------------------------------------------------------------------------
+# Wave validation
+# ---------------------------------------------------------------------------
 
 class WaveValidator:
     """
     Validates wave structures against Elliott Wave / NEoWave rules.
-    This is called DURING wave construction to reject invalid patterns early.
     """
-    
+
     @staticmethod
-    def validate_wave_structure(waves: List[HierarchicalWave], 
-                                 pattern_type: str = 'impulse') -> Tuple[bool, List[str], float]:
-        """
-        Validate a wave structure against critical rules.
-        
-        Args:
-            waves: List of HierarchicalWave objects
-            pattern_type: 'impulse' or 'diagonal'
-        
-        Returns:
-            Tuple of (is_valid, list_of_violations, confidence_score)
-        """
+    def validate_wave_structure(waves: List[HierarchicalWave],
+                                 pattern_type: str = 'impulse'
+                                 ) -> Tuple[bool, List[str], float]:
         violations = []
         confidence = 100.0
-        
+
         if len(waves) < 2:
             return True, [], confidence
-        
-        # Determine trend direction from Wave 1
+
         is_uptrend = WaveValidator._is_uptrend(waves)
-        
-        # =================================================================
-        # RULE 1: Wave 2 cannot exceed Wave 1's origin (CRITICAL)
-        # =================================================================
+
         if len(waves) >= 2:
-            valid, message = WaveValidator._check_wave2_origin(waves, is_uptrend)
+            valid, msg = WaveValidator._check_wave2_origin(waves, is_uptrend)
             if not valid:
-                violations.append(f"CRITICAL: {message}")
-                confidence = 0  # Pattern is INVALID
-                return False, violations, confidence
-        
-        # =================================================================
-        # RULE 2: Wave 4 cannot exceed Wave 3's origin (CRITICAL)
-        # =================================================================
+                return False, [f"CRITICAL: {msg}"], 0.0
+
         if len(waves) >= 4:
-            valid, message = WaveValidator._check_wave4_origin(waves, is_uptrend)
+            valid, msg = WaveValidator._check_wave4_origin(waves, is_uptrend)
             if not valid:
-                violations.append(f"CRITICAL: {message}")
-                confidence = 0
-                return False, violations, confidence
-        
-        # =================================================================
-        # RULE 3: Wave 3 must exceed Wave 1's endpoint
-        # =================================================================
+                return False, [f"CRITICAL: {msg}"], 0.0
+
         if len(waves) >= 3:
-            valid, message = WaveValidator._check_wave3_exceeds_wave1(waves, is_uptrend)
+            valid, msg = WaveValidator._check_wave3_exceeds_wave1(waves, is_uptrend)
             if not valid:
-                violations.append(f"CRITICAL: {message}")
-                confidence = 0
-                return False, violations, confidence
-        
-        # =================================================================
-        # RULE 4: Wave 5 must exceed Wave 3's endpoint (for motive patterns)
-        # =================================================================
+                return False, [f"CRITICAL: {msg}"], 0.0
+
         if len(waves) >= 5:
-            valid, message = WaveValidator._check_wave5_exceeds_wave3(waves, is_uptrend)
+            valid, msg = WaveValidator._check_wave5_exceeds_wave3(waves, is_uptrend)
             if not valid:
-                violations.append(f"WARNING: {message}")
-                confidence -= 30  # Significant penalty but not invalid
-        
-        # =================================================================
-        # RULE 5: Wave 3 cannot be the shortest (for impulse)
-        # =================================================================
+                violations.append(f"WARNING: {msg}")
+                confidence -= 30
+
         if len(waves) >= 5 and pattern_type == 'impulse':
-            valid, message = WaveValidator._check_wave3_not_shortest(waves)
+            valid, msg = WaveValidator._check_wave3_not_shortest(waves)
             if not valid:
-                violations.append(f"CRITICAL: {message}")
-                confidence = 0
-                return False, violations, confidence
-        
-        # =================================================================
-        # RULE 6: Wave 4 overlap rule
-        # =================================================================
+                return False, [f"CRITICAL: {msg}"], 0.0
+
         if len(waves) >= 4:
             has_overlap = WaveValidator._check_wave4_wave1_overlap(waves, is_uptrend)
-            
             if pattern_type == 'impulse' and has_overlap:
-                violations.append("CRITICAL: Wave 4 overlaps Wave 1 (not allowed in impulse)")
-                confidence = 0
-                return False, violations, confidence
+                return False, ["CRITICAL: Wave 4 overlaps Wave 1"], 0.0
             elif pattern_type == 'diagonal' and not has_overlap:
                 violations.append("WARNING: Wave 4 should overlap Wave 1 in diagonal")
                 confidence -= 20
-        
-        return len(violations) == 0 or confidence > 0, violations, max(0, confidence)
-    
-    @staticmethod
-    def _is_uptrend(waves: List[HierarchicalWave]) -> bool:
-        """Determine if pattern is in uptrend"""
-        if not waves or len(waves) == 0:
-            return True
-        
-        wave1 = waves[0]
-        if wave1.start_price is None or wave1.end_price is None:
-            return True
-        
-        return wave1.end_price > wave1.start_price
-    
-    @staticmethod
-    def _check_wave2_origin(waves: List[HierarchicalWave], is_uptrend: bool) -> Tuple[bool, str]:
-        """
-        Check that Wave 2 does not exceed Wave 1's origin.
-        """
-        wave1 = waves[0]
-        wave2 = waves[1]
-        
-        wave1_origin = wave1.start_price
-        
-        if wave1_origin is None:
-            return True, ""
-        
-        # Get Wave 2's extreme point
-        if is_uptrend:
-            # In uptrend, check Wave 2's lowest point
-            wave2_extreme = wave2.low_price if wave2.low_price else wave2.end_price
-            if wave2_extreme is None:
-                return True, ""
-            
-            if wave2_extreme < wave1_origin:
-                return False, f"Wave 2 low ({wave2_extreme:.2f}) went below Wave 1 origin ({wave1_origin:.2f})"
-        else:
-            # In downtrend, check Wave 2's highest point
-            wave2_extreme = wave2.high_price if wave2.high_price else wave2.end_price
-            if wave2_extreme is None:
-                return True, ""
-            
-            if wave2_extreme > wave1_origin:
-                return False, f"Wave 2 high ({wave2_extreme:.2f}) went above Wave 1 origin ({wave1_origin:.2f})"
-        
-        return True, ""
-    
-    @staticmethod
-    def _check_wave4_origin(waves: List[HierarchicalWave], is_uptrend: bool) -> Tuple[bool, str]:
-        """
-        Check that Wave 4 does not exceed Wave 3's origin.
-        """
-        wave3 = waves[2]
-        wave4 = waves[3]
-        
-        wave3_origin = wave3.start_price
-        
-        if wave3_origin is None:
-            return True, ""
-        
-        if is_uptrend:
-            wave4_extreme = wave4.low_price if wave4.low_price else wave4.end_price
-            if wave4_extreme is None:
-                return True, ""
-            
-            if wave4_extreme < wave3_origin:
-                return False, f"Wave 4 low ({wave4_extreme:.2f}) went below Wave 3 origin ({wave3_origin:.2f})"
-        else:
-            wave4_extreme = wave4.high_price if wave4.high_price else wave4.end_price
-            if wave4_extreme is None:
-                return True, ""
-            
-            if wave4_extreme > wave3_origin:
-                return False, f"Wave 4 high ({wave4_extreme:.2f}) went above Wave 3 origin ({wave3_origin:.2f})"
-        
-        return True, ""
-    
-    @staticmethod
-    def _check_wave3_exceeds_wave1(waves: List[HierarchicalWave], is_uptrend: bool) -> Tuple[bool, str]:
-        """
-        Check that Wave 3 exceeds Wave 1's endpoint.
-        """
-        wave1 = waves[0]
-        wave3 = waves[2]
-        
-        if wave1.end_price is None or wave3.end_price is None:
-            return True, ""
-        
-        if is_uptrend:
-            if wave3.end_price <= wave1.end_price:
-                return False, f"Wave 3 end ({wave3.end_price:.2f}) did not exceed Wave 1 end ({wave1.end_price:.2f})"
-        else:
-            if wave3.end_price >= wave1.end_price:
-                return False, f"Wave 3 end ({wave3.end_price:.2f}) did not exceed Wave 1 end ({wave1.end_price:.2f})"
-        
-        return True, ""
-    
-    @staticmethod
-    def _check_wave5_exceeds_wave3(waves: List[HierarchicalWave], is_uptrend: bool) -> Tuple[bool, str]:
-        """
-        Check that Wave 5 exceeds Wave 3's endpoint.
-        """
-        wave3 = waves[2]
-        wave5 = waves[4]
-        
-        if wave3.end_price is None or wave5.end_price is None:
-            return True, ""
-        
-        if is_uptrend:
-            if wave5.end_price <= wave3.end_price:
-                return False, f"Wave 5 end ({wave5.end_price:.2f}) did not exceed Wave 3 end ({wave3.end_price:.2f})"
-        else:
-            if wave5.end_price >= wave3.end_price:
-                return False, f"Wave 5 end ({wave5.end_price:.2f}) did not exceed Wave 3 end ({wave3.end_price:.2f})"
-        
-        return True, ""
-    
-    @staticmethod
-    def _check_wave3_not_shortest(waves: List[HierarchicalWave]) -> Tuple[bool, str]:
-        """
-        Check that Wave 3 is not the shortest motive wave.
-        """
-        w1_len = abs(waves[0].price_movement) if waves[0].price_movement else 0
-        w3_len = abs(waves[2].price_movement) if waves[2].price_movement else 0
-        w5_len = abs(waves[4].price_movement) if waves[4].price_movement else 0
-        
-        if w3_len < w1_len and w3_len < w5_len:
-            return False, f"Wave 3 ({w3_len:.2f}) is shorter than both Wave 1 ({w1_len:.2f}) and Wave 5 ({w5_len:.2f})"
-        
-        return True, ""
-    
-    @staticmethod
-    def _check_wave4_wave1_overlap(waves: List[HierarchicalWave], is_uptrend: bool) -> bool:
-        """
-        Check if Wave 4 overlaps Wave 1's price territory.
-        Returns True if there IS overlap.
-        """
-        wave1 = waves[0]
-        wave4 = waves[3]
-        
-        w1_high = wave1.high_price or max(wave1.start_price or 0, wave1.end_price or 0)
-        w1_low = wave1.low_price or min(wave1.start_price or float('inf'), wave1.end_price or float('inf'))
-        
-        w4_high = wave4.high_price or max(wave4.start_price or 0, wave4.end_price or 0)
-        w4_low = wave4.low_price or min(wave4.start_price or float('inf'), wave4.end_price or float('inf'))
-        
-        if is_uptrend:
-            # In uptrend, overlap occurs if Wave 4 low goes below Wave 1 high
-            return w4_low < w1_high
-        else:
-            # In downtrend, overlap occurs if Wave 4 high goes above Wave 1 low
-            return w4_high > w1_low
 
+        return True, violations, max(0.0, confidence)
+
+    @staticmethod
+    def _is_uptrend(waves):
+        if not waves:
+            return True
+        w = waves[0]
+        if w.start_price is None or w.end_price is None:
+            return True
+        return w.end_price > w.start_price
+
+    @staticmethod
+    def _check_wave2_origin(waves, is_uptrend):
+        w1, w2 = waves[0], waves[1]
+        if w1.start_price is None:
+            return True, ""
+        if is_uptrend:
+            extreme = w2.low_price if w2.low_price else w2.end_price
+            if extreme and extreme < w1.start_price:
+                return False, f"Wave 2 low ({extreme:.2f}) below Wave 1 origin ({w1.start_price:.2f})"
+        else:
+            extreme = w2.high_price if w2.high_price else w2.end_price
+            if extreme and extreme > w1.start_price:
+                return False, f"Wave 2 high ({extreme:.2f}) above Wave 1 origin ({w1.start_price:.2f})"
+        return True, ""
+
+    @staticmethod
+    def _check_wave4_origin(waves, is_uptrend):
+        w3, w4 = waves[2], waves[3]
+        if w3.start_price is None:
+            return True, ""
+        if is_uptrend:
+            extreme = w4.low_price if w4.low_price else w4.end_price
+            if extreme and extreme < w3.start_price:
+                return False, f"Wave 4 low ({extreme:.2f}) below Wave 3 origin ({w3.start_price:.2f})"
+        else:
+            extreme = w4.high_price if w4.high_price else w4.end_price
+            if extreme and extreme > w3.start_price:
+                return False, f"Wave 4 high ({extreme:.2f}) above Wave 3 origin ({w3.start_price:.2f})"
+        return True, ""
+
+    @staticmethod
+    def _check_wave3_exceeds_wave1(waves, is_uptrend):
+        w1, w3 = waves[0], waves[2]
+        if w1.end_price is None or w3.end_price is None:
+            return True, ""
+        if is_uptrend and w3.end_price <= w1.end_price:
+            return False, f"Wave 3 ({w3.end_price:.2f}) did not exceed Wave 1 ({w1.end_price:.2f})"
+        if not is_uptrend and w3.end_price >= w1.end_price:
+            return False, f"Wave 3 ({w3.end_price:.2f}) did not exceed Wave 1 ({w1.end_price:.2f})"
+        return True, ""
+
+    @staticmethod
+    def _check_wave5_exceeds_wave3(waves, is_uptrend):
+        w3, w5 = waves[2], waves[4]
+        if w3.end_price is None or w5.end_price is None:
+            return True, ""
+        if is_uptrend and w5.end_price <= w3.end_price:
+            return False, "Wave 5 did not exceed Wave 3"
+        if not is_uptrend and w5.end_price >= w3.end_price:
+            return False, "Wave 5 did not exceed Wave 3"
+        return True, ""
+
+    @staticmethod
+    def _check_wave3_not_shortest(waves):
+        w1 = abs(waves[0].price_movement) if waves[0].price_movement else 0
+        w3 = abs(waves[2].price_movement) if waves[2].price_movement else 0
+        w5 = abs(waves[4].price_movement) if waves[4].price_movement else 0
+        if w3 < w1 and w3 < w5:
+            return False, f"Wave 3 ({w3:.2f}) is shortest motive wave"
+        return True, ""
+
+    @staticmethod
+    def _check_wave4_wave1_overlap(waves, is_uptrend):
+        w1, w4 = waves[0], waves[3]
+        w1h = w1.high_price or max(w1.start_price or 0, w1.end_price or 0)
+        w1l = w1.low_price or min(w1.start_price or float('inf'), w1.end_price or float('inf'))
+        w4h = w4.high_price or max(w4.start_price or 0, w4.end_price or 0)
+        w4l = w4.low_price or min(w4.start_price or float('inf'), w4.end_price or float('inf'))
+        return w4l < w1h if is_uptrend else w4h > w1l
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical wave builder  (top-down — the core architectural fix)
+# ---------------------------------------------------------------------------
 
 class HierarchicalWaveBuilder:
     """
-    Builds hierarchical wave structure from multi-degree pivots.
-    Now includes validation to reject invalid wave structures.
+    Builds hierarchical wave structure correctly, top-down:
+
+      PRIMARY   → detected on full dataset (coarse pivots)
+      INTERMEDIATE → detected inside each Primary wave's time window
+      MINOR        → detected inside each Intermediate wave's time window
+
+    This is the correct NEoWave methodology. Each sub-degree wave is a
+    subdivision of its parent, not an independent scan of the full chart.
     """
-    
+
     def __init__(self, degrees: List[WaveDegree] = None):
         self.degrees = degrees or [
             WaveDegree.PRIMARY,
@@ -313,127 +247,340 @@ class HierarchicalWaveBuilder:
         ]
         self.wave_id_counter = 0
         self.validator = WaveValidator()
-    
+        self._detector = MultiDegreePivotDetector(degrees=self.degrees)
+
     def _next_id(self) -> int:
-        """Generate unique wave ID"""
         self.wave_id_counter += 1
         return self.wave_id_counter
-    
-    def build(self, 
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    def build(self,
               df: pd.DataFrame,
-              multi_degree_pivots: Dict[WaveDegree, List[Dict]]) -> Optional[HierarchicalWaveCount]:
+              multi_degree_pivots: Dict[WaveDegree, List[Dict]]
+              ) -> Optional[HierarchicalWaveCount]:
         """
-        Build and validate hierarchical wave structure.
+        Build the full hierarchical wave structure top-down.
         """
         self.wave_id_counter = 0
-        
+
         primary_degree = self.degrees[0] if self.degrees else WaveDegree.PRIMARY
         primary_pivots = multi_degree_pivots.get(primary_degree, [])
-        
+
         if len(primary_pivots) < 3:
             return None
-        
-        # Try to find the best valid wave structure
-        best_wave_count = None
-        best_confidence = -1
-        
-        # Try different starting points
-        for start_idx in range(max(0, len(primary_pivots) - 10)):
-            for wave_count in [5, 3, 7, 9]:  # Try different pattern sizes
+
+        # Step 1: find all valid Primary-level patterns across the full chart
+        primary_segments = self._find_all_valid_patterns(
+            df=df,
+            pivots=primary_pivots,
+            degree=primary_degree
+        )
+
+        if not primary_segments:
+            return self._create_developing_pattern(df, primary_pivots, primary_degree)
+
+        # Step 2 & 3: for each Primary wave, drill down into sub-degrees
+        all_primary_waves: List[HierarchicalWave] = []
+        all_violations: List[str] = []
+        total_confidence = 0.0
+
+        for waves, confidence, violations in primary_segments:
+            for wave in waves:
+                # Detect Intermediate (and then Minor) pivots INSIDE this wave
+                self._build_subwaves_topdown(df, wave, degree_index=0)
+
+            all_primary_waves.extend(waves)
+            all_violations.extend(violations)
+            total_confidence += confidence
+
+        avg_confidence = total_confidence / len(primary_segments)
+        best_waves = max(primary_segments, key=lambda x: x[1])[0]
+        pattern_name, pattern_conf = self._identify_pattern(best_waves)
+        final_confidence = avg_confidence * 0.7 + pattern_conf * 0.3
+
+        degree_confidence = self._calculate_degree_confidence(all_primary_waves)
+
+        wave_count_obj = HierarchicalWaveCount(
+            primary_waves=all_primary_waves,
+            pattern_name=pattern_name,
+            confidence=final_confidence,
+            description=self._generate_description(
+                all_primary_waves, pattern_name, all_violations
+            ),
+            degrees_analyzed=self.degrees,
+            degree_confidence=degree_confidence
+        )
+
+        for v in all_violations:
+            wave_count_obj.warnings.append(v)
+
+        self._calculate_targets(wave_count_obj)
+        return wave_count_obj
+
+    # ------------------------------------------------------------------
+    # Top-down subdivision builder
+    # ------------------------------------------------------------------
+
+    def _build_subwaves_topdown(self,
+                                 df: pd.DataFrame,
+                                 parent_wave: HierarchicalWave,
+                                 degree_index: int) -> None:
+        """
+        Recursively build sub-waves inside a parent wave by:
+          1. Slicing df to the parent's exact time window.
+          2. Re-detecting pivots at the child degree on that slice only.
+          3. Finding valid sub-patterns within the slice.
+          4. Recursing into each sub-wave for the next finer degree.
+
+        This ensures sub-waves are always physically contained within
+        their parent and labels are assigned independently per parent.
+        """
+        if degree_index >= len(self.degrees) - 1:
+            return
+
+        child_degree = self.degrees[degree_index + 1]
+        child_config = DEGREE_CONFIGS.get(child_degree)
+        if not child_config:
+            return
+
+        # Slice OHLC to parent wave's window
+        mask = (df.index >= parent_wave.start_time) & (df.index <= parent_wave.end_time)
+        segment_df = df[mask]
+
+        min_bars = child_config.lookback + child_config.lookahead + 3
+        if len(segment_df) < min_bars:
+            return
+
+        # Detect child-degree pivots within this slice
+        child_pivots = self._detector.detect_for_degree(segment_df, child_degree)
+
+        if len(child_pivots) < 2:
+            return
+
+        # Anchor to parent boundaries
+        child_pivots = self._anchor_to_parent(child_pivots, parent_wave, child_degree)
+
+        if len(child_pivots) < 3:
+            return
+
+        # Find valid sub-patterns
+        sub_segments = self._find_all_valid_patterns(
+            df=segment_df,
+            pivots=child_pivots,
+            degree=child_degree
+        )
+
+        if not sub_segments:
+            # No valid Elliott pattern — store raw waves for visibility
+            raw_waves = self._build_waves_from_pivots(segment_df, child_pivots, child_degree)
+            if raw_waves:
+                for w in raw_waves:
+                    w.parent = parent_wave
+                parent_wave.sub_waves = raw_waves
+                parent_wave.subdivision_confidence = 30.0
+            return
+
+        sub_waves: List[HierarchicalWave] = []
+        total_conf = 0.0
+        for waves, conf, _ in sub_segments:
+            sub_waves.extend(waves)
+            total_conf += conf
+
+        for w in sub_waves:
+            w.parent = parent_wave
+
+        parent_wave.sub_waves = sub_waves
+        parent_wave.subdivision_confidence = total_conf / len(sub_segments)
+
+        # Recurse into each sub-wave
+        for sub_wave in sub_waves:
+            self._build_subwaves_topdown(df, sub_wave, degree_index + 1)
+
+    def _anchor_to_parent(self,
+                           pivots: List[Dict],
+                           parent_wave: HierarchicalWave,
+                           degree: WaveDegree) -> List[Dict]:
+        """
+        Ensure the parent wave's start and end prices appear in the pivot
+        list so sub-waves are anchored to the parent wave boundaries.
+        """
+        tolerance = 3600  # 1 hour in seconds
+
+        has_start = any(
+            abs((p['time'] - parent_wave.start_time).total_seconds()) < tolerance
+            for p in pivots
+        )
+        has_end = any(
+            abs((p['time'] - parent_wave.end_time).total_seconds()) < tolerance
+            for p in pivots
+        )
+
+        result = list(pivots)
+
+        if not has_start:
+            result.insert(0, {
+                'time': parent_wave.start_time,
+                'price': parent_wave.start_price,
+                'type': 'high' if parent_wave.price_movement < 0 else 'low',
+                'degree': degree,
+                'index': -1
+            })
+
+        if not has_end:
+            result.append({
+                'time': parent_wave.end_time,
+                'price': parent_wave.end_price,
+                'type': 'low' if parent_wave.price_movement < 0 else 'high',
+                'degree': degree,
+                'index': -1
+            })
+
+        return sorted(result, key=lambda p: p['time'])
+
+    # ------------------------------------------------------------------
+    # Greedy pattern finder
+    # ------------------------------------------------------------------
+
+    def _find_all_valid_patterns(self,
+                                  df: pd.DataFrame,
+                                  pivots: List[Dict],
+                                  degree: WaveDegree
+                                  ) -> List[Tuple[List[HierarchicalWave], float, List[str]]]:
+        """
+        Greedy left-to-right scan. At each position try 9→7→5→3 wave patterns.
+        When a valid one is found, advance past it (sharing last pivot as next start).
+        Returns list of (waves, confidence, violations).
+        """
+        results = []
+        start_idx = 0
+
+        while start_idx < len(pivots):
+            best = None  # (size, end_idx, waves, confidence, violations)
+
+            for wave_count in [9, 7, 5, 3]:
                 end_idx = start_idx + wave_count + 1
-                
-                if end_idx > len(primary_pivots):
+                if end_idx > len(pivots):
                     continue
-                
-                subset_pivots = primary_pivots[start_idx:end_idx]
-                
-                # Build waves from this subset
-                primary_waves = self._build_waves_from_pivots(
-                    df=df,
-                    pivots=subset_pivots,
-                    degree=primary_degree
-                )
-                
-                if not primary_waves:
+
+                subset = pivots[start_idx:end_idx]
+                waves = self._build_waves_from_pivots(df, subset, degree)
+                if not waves:
                     continue
-                
-                # Determine pattern type
-                pattern_type = 'impulse' if len(primary_waves) == 5 else 'corrective'
-                
-                # VALIDATE the wave structure
+
+                ptype = 'impulse' if len(waves) == 5 else 'corrective'
                 is_valid, violations, confidence = self.validator.validate_wave_structure(
-                    primary_waves, 
-                    pattern_type=pattern_type
+                    waves, pattern_type=ptype
                 )
-                
-                # Skip invalid patterns
+
                 if not is_valid or confidence == 0:
                     continue
-                
-                # Check if this is better than current best
-                if confidence > best_confidence:
-                    # Build subdivisions
-                    for wave in primary_waves:
-                        self._build_subdivisions(
-                            df=df,
-                            parent_wave=wave,
-                            multi_degree_pivots=multi_degree_pivots,
-                            current_degree_index=0
-                        )
-                    
-                    # Determine pattern name
-                    pattern_name, pattern_conf = self._identify_pattern(primary_waves)
-                    
-                    # Combine confidences
-                    final_confidence = confidence * 0.7 + pattern_conf * 0.3
-                    
-                    # Calculate degree confidence
-                    degree_confidence = self._calculate_degree_confidence(primary_waves)
-                    
-                    # Create wave count
-                    wave_count_obj = HierarchicalWaveCount(
-                        primary_waves=primary_waves,
-                        pattern_name=pattern_name,
-                        confidence=final_confidence,
-                        description=self._generate_description(primary_waves, pattern_name, violations),
-                        degrees_analyzed=self.degrees,
-                        degree_confidence=degree_confidence
-                    )
-                    
-                    # Add violations as warnings
-                    for v in violations:
-                        wave_count_obj.warnings.append(v)
-                    
-                    # Calculate targets
-                    self._calculate_targets(wave_count_obj)
-                    
-                    best_wave_count = wave_count_obj
-                    best_confidence = final_confidence
-        
-        # If no valid pattern found, try to create a basic "developing" pattern
-        if best_wave_count is None:
-            best_wave_count = self._create_developing_pattern(df, primary_pivots, primary_degree)
-        
-        return best_wave_count
-    
-    def _create_developing_pattern(self, df: pd.DataFrame, 
-                                    pivots: List[Dict], 
+
+                if best is None or wave_count > best[0]:
+                    best = (wave_count, end_idx, waves, confidence, violations)
+
+            if best is not None:
+                _, end_idx, waves, confidence, violations = best
+                results.append((waves, confidence, violations))
+                start_idx = end_idx - 1  # Share last pivot as next start
+            else:
+                start_idx += 1
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Wave construction
+    # ------------------------------------------------------------------
+
+    def _build_waves_from_pivots(self,
+                                  df: pd.DataFrame,
+                                  pivots: List[Dict],
+                                  degree: WaveDegree) -> List[HierarchicalWave]:
+        """Convert a list of pivots into HierarchicalWave objects."""
+        if len(pivots) < 2:
+            return []
+
+        config = DEGREE_CONFIGS.get(degree)
+        sorted_pivots = sorted(pivots, key=lambda p: p['time'])
+        num_waves = len(sorted_pivots) - 1
+
+        # Check specific counts BEFORE generic >= 5 to avoid 7/9 being
+        # mislabelled with motive labels.
+        if num_waves == 9:
+            labels = (config.labels_corrective[:9]
+                      if len(config.labels_corrective) >= 9
+                      else ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'])
+            wave_types = [
+                WaveType.MOTIVE if i % 2 == 0 else WaveType.CORRECTIVE
+                for i in range(9)
+            ]
+        elif num_waves == 7:
+            labels = (config.labels_corrective[:7]
+                      if len(config.labels_corrective) >= 7
+                      else ['A', 'B', 'C', 'D', 'E', 'F', 'G'])
+            wave_types = [
+                WaveType.MOTIVE if i % 2 == 0 else WaveType.CORRECTIVE
+                for i in range(7)
+            ]
+        elif num_waves >= 5:
+            labels = config.labels_motive[:5]
+            wave_types = [
+                WaveType.MOTIVE, WaveType.CORRECTIVE, WaveType.MOTIVE,
+                WaveType.CORRECTIVE, WaveType.MOTIVE
+            ]
+        elif num_waves >= 3:
+            labels = config.labels_corrective[:3]
+            wave_types = [WaveType.MOTIVE, WaveType.CORRECTIVE, WaveType.MOTIVE]
+        else:
+            labels = config.labels_motive[:num_waves]
+            wave_types = [
+                WaveType.MOTIVE if i % 2 == 0 else WaveType.CORRECTIVE
+                for i in range(num_waves)
+            ]
+
+        waves = []
+        for i in range(min(num_waves, len(labels))):
+            sp = sorted_pivots[i]
+            ep = sorted_pivots[i + 1]
+
+            mask = (df.index >= sp['time']) & (df.index <= ep['time'])
+            seg = df[mask]
+
+            high_price = seg['high'].max() if len(seg) > 0 else max(sp['price'], ep['price'])
+            low_price = seg['low'].min() if len(seg) > 0 else min(sp['price'], ep['price'])
+
+            wave = HierarchicalWave(
+                id=self._next_id(),
+                label=labels[i],
+                degree=degree,
+                wave_type=wave_types[i] if i < len(wave_types) else WaveType.MOTIVE,
+                start_time=sp['time'],
+                end_time=ep['time'],
+                start_price=sp['price'],
+                end_price=ep['price'],
+                high_price=high_price,
+                low_price=low_price
+            )
+            waves.append(wave)
+
+        return waves
+
+    # ------------------------------------------------------------------
+    # Fallback
+    # ------------------------------------------------------------------
+
+    def _create_developing_pattern(self,
+                                    df: pd.DataFrame,
+                                    pivots: List[Dict],
                                     degree: WaveDegree) -> Optional[HierarchicalWaveCount]:
-        """
-        Create a basic pattern when no valid Elliott Wave pattern is found.
-        """
         if len(pivots) < 3:
             return None
-        
-        # Take the most recent pivots
-        recent_pivots = pivots[-6:] if len(pivots) >= 6 else pivots
-        
-        waves = self._build_waves_from_pivots(df, recent_pivots, degree)
-        
+        recent = pivots[-6:] if len(pivots) >= 6 else pivots
+        waves = self._build_waves_from_pivots(df, recent, degree)
         if not waves:
             return None
-        
-        # Don't validate - just mark as developing
         return HierarchicalWaveCount(
             primary_waves=waves,
             pattern_name="Developing",
@@ -442,254 +589,98 @@ class HierarchicalWaveBuilder:
             degrees_analyzed=self.degrees,
             degree_confidence={d.name: 0.0 for d in self.degrees}
         )
-    
-    def _build_waves_from_pivots(self,
-                                  df: pd.DataFrame,
-                                  pivots: List[Dict],
-                                  degree: WaveDegree) -> List[HierarchicalWave]:
-        """Convert pivots to HierarchicalWave objects."""
-        if len(pivots) < 2:
-            return []
-        
-        config = DEGREE_CONFIGS.get(degree)
-        waves = []
-        
-        sorted_pivots = sorted(pivots, key=lambda p: p['time'])
-        num_waves = len(sorted_pivots) - 1
-        
-        # Select labels based on wave count
-        if num_waves >= 5:
-            labels = config.labels_motive[:5]
-            wave_types = [WaveType.MOTIVE, WaveType.CORRECTIVE, WaveType.MOTIVE, 
-                         WaveType.CORRECTIVE, WaveType.MOTIVE]
-        elif num_waves >= 3:
-            labels = config.labels_corrective[:3]
-            wave_types = [WaveType.MOTIVE, WaveType.CORRECTIVE, WaveType.MOTIVE]
-        elif num_waves == 7:
-            labels = config.labels_corrective[:7] if len(config.labels_corrective) >= 7 else ['A','B','C','D','E','F','G']
-            wave_types = [WaveType.MOTIVE if i % 2 == 0 else WaveType.CORRECTIVE for i in range(7)]
-        else:
-            labels = config.labels_motive[:num_waves]
-            wave_types = [WaveType.MOTIVE if i % 2 == 0 else WaveType.CORRECTIVE 
-                         for i in range(num_waves)]
-        
-        for i in range(min(len(sorted_pivots) - 1, len(labels))):
-            start_pivot = sorted_pivots[i]
-            end_pivot = sorted_pivots[i + 1]
-            
-            mask = (df.index >= start_pivot['time']) & (df.index <= end_pivot['time'])
-            segment = df[mask]
-            
-            high_price = segment['high'].max() if len(segment) > 0 else max(start_pivot['price'], end_pivot['price'])
-            low_price = segment['low'].min() if len(segment) > 0 else min(start_pivot['price'], end_pivot['price'])
-            
-            wave = HierarchicalWave(
-                id=self._next_id(),
-                label=labels[i],
-                degree=degree,
-                wave_type=wave_types[i] if i < len(wave_types) else WaveType.MOTIVE,
-                start_time=start_pivot['time'],
-                end_time=end_pivot['time'],
-                start_price=start_pivot['price'],
-                end_price=end_pivot['price'],
-                high_price=high_price,
-                low_price=low_price
-            )
-            
-            waves.append(wave)
-        
-        return waves
-    
-    def _build_subdivisions(self,
-                            df: pd.DataFrame,
-                            parent_wave: HierarchicalWave,
-                            multi_degree_pivots: Dict[WaveDegree, List[Dict]],
-                            current_degree_index: int) -> None:
-        """Recursively build subdivisions for a parent wave."""
-        if current_degree_index >= len(self.degrees) - 1:
-            return
-        
-        child_degree = self.degrees[current_degree_index + 1]
-        child_pivots = multi_degree_pivots.get(child_degree, [])
-        
-        if not child_pivots:
-            return
-        
-        parent_start = parent_wave.start_time
-        parent_end = parent_wave.end_time
-        
-        relevant_pivots = [
-            p for p in child_pivots
-            if parent_start <= p['time'] <= parent_end
-        ]
-        
-        if len(relevant_pivots) < 2:
-            return
-        
-        # Add boundary pivots
-        start_pivot = {'time': parent_start, 'price': parent_wave.start_price, 'type': 'start', 'degree': child_degree}
-        end_pivot = {'time': parent_end, 'price': parent_wave.end_price, 'type': 'end', 'degree': child_degree}
-        
-        has_start = any(abs((p['time'] - parent_start).total_seconds()) < 60 for p in relevant_pivots)
-        has_end = any(abs((p['time'] - parent_end).total_seconds()) < 60 for p in relevant_pivots)
-        
-        if not has_start:
-            relevant_pivots.insert(0, start_pivot)
-        if not has_end:
-            relevant_pivots.append(end_pivot)
-        
-        relevant_pivots = sorted(relevant_pivots, key=lambda p: p['time'])
-        
-        child_waves = self._build_waves_from_pivots(
-            df=df,
-            pivots=relevant_pivots,
-            degree=child_degree
-        )
-        
-        # Validate subdivisions too
-        if child_waves:
-            is_valid, _, sub_confidence = WaveValidator.validate_wave_structure(
-                child_waves, 
-                pattern_type='impulse' if parent_wave.wave_type == WaveType.MOTIVE else 'corrective'
-            )
-            
-            parent_wave.subdivision_confidence = sub_confidence
-            
-            if is_valid:
-                for child in child_waves:
-                    child.parent = parent_wave
-                parent_wave.sub_waves = child_waves
-                
-                # Recursive
-                for child in child_waves:
-                    self._build_subdivisions(
-                        df=df,
-                        parent_wave=child,
-                        multi_degree_pivots=multi_degree_pivots,
-                        current_degree_index=current_degree_index + 1
-                    )
-    
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     def _identify_pattern(self, waves: List[HierarchicalWave]) -> Tuple[str, float]:
-        """Identify pattern type from waves."""
-        num_waves = len(waves)
-        
-        if num_waves == 5:
-            if self._check_wave4_overlap_exists(waves):
-                return "Diagonal", 70.0
-            else:
-                return "Impulse", 85.0
-        elif num_waves == 3:
-            if self._is_zigzag(waves):
-                return "Zigzag", 80.0
-            else:
-                return "Flat", 75.0
-        elif num_waves == 7:
+        n = len(waves)
+        if n == 5:
+            return ("Diagonal", 70.0) if self._has_wave4_overlap(waves) else ("Impulse", 85.0)
+        elif n == 3:
+            return ("Zigzag", 80.0) if self._is_zigzag(waves) else ("Flat", 75.0)
+        elif n == 7:
             return "Diametric", 70.0
-        elif num_waves == 9:
+        elif n == 9:
             return "Symmetrical", 65.0
-        else:
-            return "Developing", 40.0
-    
-    def _check_wave4_overlap_exists(self, waves: List[HierarchicalWave]) -> bool:
-        """Check if Wave 4 overlaps Wave 1"""
+        return "Developing", 40.0
+
+    def _has_wave4_overlap(self, waves):
         if len(waves) < 4:
             return False
-        
-        wave1 = waves[0]
-        wave4 = waves[3]
-        
-        w1_range = (min(wave1.start_price or 0, wave1.end_price or 0), 
-                   max(wave1.start_price or 0, wave1.end_price or 0))
-        w4_range = (min(wave4.start_price or 0, wave4.end_price or 0),
-                   max(wave4.start_price or 0, wave4.end_price or 0))
-        
-        return not (w4_range[0] > w1_range[1] or w4_range[1] < w1_range[0])
-    
-    def _is_zigzag(self, waves: List[HierarchicalWave]) -> bool:
-        """Check if pattern is zigzag"""
+        w1, w4 = waves[0], waves[3]
+        r1 = (min(w1.start_price or 0, w1.end_price or 0),
+               max(w1.start_price or 0, w1.end_price or 0))
+        r4 = (min(w4.start_price or 0, w4.end_price or 0),
+               max(w4.start_price or 0, w4.end_price or 0))
+        return not (r4[0] > r1[1] or r4[1] < r1[0])
+
+    def _is_zigzag(self, waves):
         if len(waves) != 3:
             return False
-        
-        a_length = abs(waves[0].price_movement) if waves[0].price_movement else 0
-        b_length = abs(waves[1].price_movement) if waves[1].price_movement else 0
-        
-        if a_length == 0:
+        a = abs(waves[0].price_movement) if waves[0].price_movement else 0
+        b = abs(waves[1].price_movement) if waves[1].price_movement else 0
+        if a == 0:
             return False
-        
-        b_retracement = b_length / a_length
-        return 0.3 <= b_retracement <= 0.85
-    
-    def _calculate_degree_confidence(self, waves: List[HierarchicalWave]) -> Dict[str, float]:
-        """Calculate confidence for each degree level."""
+        return 0.3 <= (b / a) <= 0.85
+
+    def _calculate_degree_confidence(self,
+                                      waves: List[HierarchicalWave]) -> Dict[str, float]:
         confidence = {}
-        
         for degree in self.degrees:
-            degree_waves = []
-            
-            def collect(wave: HierarchicalWave):
-                if wave.degree == degree:
-                    degree_waves.append(wave)
+            collected: List[HierarchicalWave] = []
+
+            def collect(wave: HierarchicalWave, target=degree, out=collected):
+                if wave.degree == target:
+                    out.append(wave)
                 for sub in wave.sub_waves:
-                    collect(sub)
-            
-            for wave in waves:
-                collect(wave)
-            
-            if degree_waves:
-                avg_confidence = np.mean([w.subdivision_confidence for w in degree_waves])
-                confidence[degree.name] = avg_confidence
-            else:
-                confidence[degree.name] = 0.0
-        
+                    collect(sub, target, out)
+
+            for w in waves:
+                collect(w)
+
+            confidence[degree.name] = (
+                float(np.mean([w.subdivision_confidence for w in collected]))
+                if collected else 0.0
+            )
         return confidence
-    
-    def _generate_description(self, waves: List[HierarchicalWave], 
-                               pattern_name: str,
-                               violations: List[str]) -> str:
-        """Generate pattern description."""
-        wave_labels = " → ".join([w.label for w in waves])
-        
-        desc = f"{pattern_name} pattern: {wave_labels}"
-        
+
+    def _generate_description(self, waves, pattern_name, violations):
+        labels = " → ".join(w.label for w in waves)
+        desc = f"{pattern_name} pattern: {labels}"
         if violations:
             desc += f". Issues: {len(violations)}"
-        
         return desc
-    
+
     def _calculate_targets(self, wave_count: HierarchicalWaveCount) -> None:
-        """Calculate price targets."""
         waves = wave_count.primary_waves
-        
         if not waves:
             return
-        
-        is_uptrend = waves[0].end_price > waves[0].start_price if waves[0].start_price and waves[0].end_price else True
-        
+
+        is_uptrend = (
+            waves[0].end_price > waves[0].start_price
+            if waves[0].start_price and waves[0].end_price else True
+        )
+
         if len(waves) >= 4:
-            wave1 = waves[0]
-            wave4 = waves[3]
-            
-            if wave1.price_movement and wave4.end_price:
-                w1_length = abs(wave1.price_movement)
+            w1, w4 = waves[0], waves[3]
+            if w1.price_movement and w4.end_price:
+                length = abs(w1.price_movement)
                 direction = 1 if is_uptrend else -1
-                
                 wave_count.add_target(
-                    price=wave4.end_price + (w1_length * 0.618 * direction),
+                    price=w4.end_price + length * 0.618 * direction,
                     description="Wave 5 = 0.618 × Wave 1",
                     probability=0.6
                 )
-                
                 wave_count.add_target(
-                    price=wave4.end_price + (w1_length * 1.0 * direction),
+                    price=w4.end_price + length * 1.0 * direction,
                     description="Wave 5 = Wave 1 (equality)",
                     probability=0.7
                 )
-                
                 if len(waves) >= 3 and waves[2].end_price:
-                    # Minimum target: just beyond Wave 3
-                    min_target = waves[2].end_price + (w1_length * 0.05 * direction)
                     wave_count.add_target(
-                        price=min_target,
+                        price=waves[2].end_price + length * 0.05 * direction,
                         description="Minimum Wave 5 target",
                         probability=0.9
                     )
